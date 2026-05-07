@@ -2,6 +2,4 @@ fastapi>=0.111.0
 pydantic>=2.7
 pydantic-settings>=2.3
 gunicorn>=22.0
-gevent>=24.2
-# For local development only (gunicorn+gevent is used in production):
-uvicorn[standard]>=0.29
+uvicorn[standard]>=0.29  # provides UvicornWorker for gunicorn

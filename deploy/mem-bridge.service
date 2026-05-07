@@ -17,8 +17,9 @@ EnvironmentFile=-/etc/mem-bridge/env
 Environment=PYTHONUNBUFFERED=1
 
 # ── Start ─────────────────────────────────────────────────────────────────────
+# FastAPI is an ASGI app; use UvicornWorker (not gevent which is WSGI-only).
 ExecStart=/opt/mem-bridge/venv/bin/gunicorn \
-    -k gevent \
+    -k uvicorn.workers.UvicornWorker \
     -w ${MEMBRIDGE_WORKERS:-1} \
     -b ${MEMBRIDGE_BIND:-127.0.0.1:8765} \
     --timeout 120 \
