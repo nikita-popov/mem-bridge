@@ -1,4 +1,5 @@
-from fastapi import Header, HTTPException
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 from app.config import settings
 
 
@@ -17,10 +18,13 @@ def _load_tokens() -> frozenset[str]:
 VALID_TOKENS: frozenset[str] = _load_tokens()
 
 
-def require_bearer(authorization: str | None = Header(default=None)) -> None:
-    """FastAPI dependency that validates a static Bearer token."""
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="missing bearer token")
-    token = authorization[7:].strip()
-    if token not in VALID_TOKENS:
-        raise HTTPException(status_code=403, detail="invalid token")
+def check_bearer(request: Request) -> JSONResponse | None:
+    """Return a JSONResponse error if auth fails, else None."""
+    if not VALID_TOKENS:
+        return None  # no tokens configured – open access
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return JSONResponse({"error": "missing bearer token"}, status_code=401)
+    if auth[7:].strip() not in VALID_TOKENS:
+        return JSONResponse({"error": "invalid token"}, status_code=403)
+    return None

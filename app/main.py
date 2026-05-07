@@ -1,25 +1,31 @@
-from fastapi import FastAPI
-from starlette.routing import Mount
-from app.routes import router
+"""ASGI entry point.
+
+Architecture:
+  /           → MCP Streamable HTTP (FastMCP)
+  /healthz    → health check (no auth)
+  /api/*      → REST endpoints (Bearer auth)
+
+We build a Starlette Router that adds /healthz and /api/* on top of the
+MCP app, which handles everything else (POST /, GET /, OPTIONS /, ...).
+This avoids app.mount() path-stripping issues.
+"""
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Route, Mount
+from starlette.middleware import Middleware
+from app.routes import build_rest_router
 from app.mcp_server import mcp_app
 
-app = FastAPI(
-    title="mem-bridge",
-    description="HTTP bridge to a local MemPalace instance",
-    version="0.3.0",
-    docs_url="/docs",
-    redoc_url=None,
+
+async def healthz(request: Request) -> JSONResponse:
+    return JSONResponse({"ok": True})
+
+
+app = Starlette(
+    routes=[
+        Route("/healthz", healthz, methods=["GET"]),
+        Mount("/api", app=build_rest_router()),
+        Mount("/", app=mcp_app),
+    ],
 )
-
-
-@app.get("/healthz", tags=["meta"])
-def healthz():
-    return {"ok": True}
-
-
-# REST API (optional, for direct use / debugging)
-app.include_router(router, prefix="/api")
-
-# MCP Streamable HTTP – Perplexity and other MCP clients connect here.
-# Endpoint: POST /mcp/  (or whatever subpath nginx strips to)
-app.mount("/mcp", mcp_app)
