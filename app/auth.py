@@ -13,11 +13,12 @@ def _load_tokens() -> frozenset[str]:
     )
 
 
-# Loaded once at import time; restart service to pick up new tokens.
+# Loaded once at process start; restart the service to pick up new tokens.
 VALID_TOKENS: frozenset[str] = _load_tokens()
 
 
 def require_bearer(authorization: str | None = Header(default=None)) -> None:
+    """FastAPI dependency that validates a static Bearer token."""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="missing bearer token")
     token = authorization[7:].strip()

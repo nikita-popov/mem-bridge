@@ -6,7 +6,7 @@ from app import mempalace as mp
 router = APIRouter(dependencies=[Depends(require_bearer)])
 
 
-# ── request models ──────────────────────────────────────────────────────────
+# ── request models ────────────────────────────────────────────────────────────
 
 class SearchReq(BaseModel):
     query: str
@@ -24,7 +24,7 @@ class RecallReq(BaseModel):
     limit: int = 10
 
 
-# ── endpoints ────────────────────────────────────────────────────────────────
+# ── endpoints ─────────────────────────────────────────────────────────────────
 
 @router.get("/status")
 def get_status():

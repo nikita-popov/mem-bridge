@@ -19,8 +19,14 @@ class CmdResult:
 
 
 def _run(*args: str, timeout: int = 120) -> CmdResult:
-    cmd = [settings.mempalace_bin, "--palace", settings.palace_path, *args]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+    cmd = [settings.mempalace_bin, *settings.palace_args(), *args]
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
     return CmdResult(proc.returncode, proc.stdout, proc.stderr)
 
 

@@ -4,7 +4,7 @@ from app.routes import router
 app = FastAPI(
     title="mem-bridge",
     description="HTTP bridge to a local MemPalace instance",
-    version="0.1.0",
+    version="0.2.0",
     docs_url="/docs",
     redoc_url=None,
 )

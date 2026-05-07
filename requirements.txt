@@ -3,4 +3,5 @@ pydantic>=2.7
 pydantic-settings>=2.3
 gunicorn>=22.0
 gevent>=24.2
-uvicorn[standard]>=0.29  # for local dev only; gunicorn+gevent used in prod
+# For local development only (gunicorn+gevent is used in production):
+uvicorn[standard]>=0.29
