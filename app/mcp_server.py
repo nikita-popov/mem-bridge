@@ -1,45 +1,61 @@
 """MCP server via Streamable HTTP transport.
 
-Exposes MemPalace tools to any MCP client (Perplexity, Cursor, Claude, etc.).
-
-Two things that must be set correctly for external clients (e.g. Perplexity):
-
-1. streamable_http_path='/' so the endpoint is POST /, not POST /mcp
-2. transport_security must allow the external hostname of the reverse proxy;
-   by default FastMCP only allows localhost (DNS rebinding protection).
-   Set MEMBRIDGE_ALLOWED_HOSTS=your-domain.example.com in the env file.
+Auth is injected as a Starlette middleware so the FastMCP Starlette app
+(including its lifespan / session_manager.run()) is used as-is.
+Wrapping the ASGI callable directly breaks lifespan events.
 """
 from typing import Any
 from mcp.server.fastmcp import FastMCP
 from mcp.server.streamable_http import TransportSecuritySettings
+from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 from app import mempalace as mp
 from app.auth import VALID_TOKENS
 from app.config import settings
 
+
 # ── transport security ──────────────────────────────────────────────────────────
 
 extra = settings.extra_allowed_hosts()
 
 if "*" in extra:
-    # Disable DNS rebinding protection entirely
     _security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
 else:
-    # Keep localhost + add any explicitly configured external hosts
     _default_hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
-    _default_origins = ["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"]
+    _default_origins = [
+        "http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*",
+    ]
     _security = TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
         allowed_hosts=_default_hosts + extra,
-        allowed_origins=_default_origins + [
-            f"https://{h}" for h in extra
-        ] + [
-            f"http://{h}" for h in extra
-        ],
+        allowed_origins=_default_origins
+            + [f"https://{h}" for h in extra]
+            + [f"http://{h}" for h in extra],
     )
 
-# ── FastMCP instance ──────────────────────────────────────────────────────────────────
+
+# ── auth middleware ────────────────────────────────────────────────────────────
+
+class BearerAuthMiddleware(BaseHTTPMiddleware):
+    """Reject requests without a valid Bearer token.
+
+    Skipped when VALID_TOKENS is empty (open access / no tokens file).
+    """
+
+    async def dispatch(self, request: Request, call_next: Any) -> Response:
+        if not VALID_TOKENS:
+            return await call_next(request)
+        auth = request.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return Response("missing bearer token", status_code=401)
+        if auth[7:].strip() not in VALID_TOKENS:
+            return Response("invalid token", status_code=403)
+        return await call_next(request)
+
+
+# ── FastMCP instance ─────────────────────────────────────────────────────────────────
 
 mcp = FastMCP(
     name="mem-bridge",
@@ -48,27 +64,12 @@ mcp = FastMCP(
         "Use `search` to recall information, `mine` to store new memories, "
         "and `recall` to retrieve memories by topic."
     ),
-    # Endpoint lives at POST / (not POST /mcp which is the default)
     streamable_http_path="/",
     transport_security=_security,
 )
 
 
-# ── auth middleware ──────────────────────────────────────────────────────────
-
-async def _check_auth(request: Request) -> Response | None:
-    """Return 401/403 Response if auth fails, else None."""
-    if not VALID_TOKENS:
-        return None  # no tokens configured – open access
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        return Response("missing bearer token", status_code=401)
-    if auth[7:].strip() not in VALID_TOKENS:
-        return Response("invalid token", status_code=403)
-    return None
-
-
-# ── MCP tools ─────────────────────────────────────────────────────────────────
+# ── tools ──────────────────────────────────────────────────────────────────────
 
 @mcp.tool()
 def search(
@@ -120,17 +121,19 @@ def status() -> dict[str, Any]:
     return mp.status().as_dict()
 
 
-# ── ASGI app with auth wrapper ────────────────────────────────────────────────
+# ── build the final ASGI app ────────────────────────────────────────────────────
+# streamable_http_app() returns a Starlette app with lifespan wired up.
+# We add BearerAuthMiddleware on top via Starlette middleware injection
+# so lifespan events reach the inner app correctly.
 
-_mcp_asgi = mcp.streamable_http_app()
+def build_mcp_app() -> Any:
+    """Return the FastMCP Starlette app with auth middleware added."""
+    starlette_app = mcp.streamable_http_app()
+    # Inject auth middleware by rebuilding middleware stack
+    starlette_app.middleware_stack = BearerAuthMiddleware(
+        app=starlette_app.middleware_stack,
+    )
+    return starlette_app
 
 
-async def mcp_app(scope: dict, receive: Any, send: Any) -> None:
-    """ASGI wrapper: checks Bearer auth, then delegates to FastMCP."""
-    if scope["type"] == "http":
-        request = Request(scope, receive)
-        deny = await _check_auth(request)
-        if deny is not None:
-            await deny(scope, receive, send)
-            return
-    await _mcp_asgi(scope, receive, send)
+mcp_app = build_mcp_app()
