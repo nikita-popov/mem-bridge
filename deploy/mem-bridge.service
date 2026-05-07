@@ -1,35 +1,19 @@
 [Unit]
-Description=mem-bridge – HTTP bridge to MemPalace
-Documentation=https://github.com/nikita-popov/mem-bridge
+Description=mem-bridge MCP HTTP bridge
 After=network.target
 
 [Service]
-# ── Identity ──────────────────────────────────────────────────────────────────
-# Adjust User/Group and WorkingDirectory to match your installation.
+Type=simple
 User=mem-bridge
 Group=mem-bridge
 WorkingDirectory=/opt/mem-bridge
-
-# ── Environment ───────────────────────────────────────────────────────────────
-# Put your settings in /etc/mem-bridge/env  (key=value, no export needed).
-# See .env.example in the repository for available variables.
 EnvironmentFile=-/etc/mem-bridge/env
-Environment=PYTHONUNBUFFERED=1
-
-# ── Start ─────────────────────────────────────────────────────────────────────
-# FastAPI is an ASGI app; use UvicornWorker (not gevent which is WSGI-only).
-ExecStart=/opt/mem-bridge/venv/bin/gunicorn \
-    -k uvicorn.workers.UvicornWorker \
-    -w ${MEMBRIDGE_WORKERS:-1} \
-    -b ${MEMBRIDGE_BIND:-127.0.0.1:8765} \
-    --timeout 120 \
-    --keep-alive 5 \
-    --access-logfile - \
-    --error-logfile - \
-    app.main:app
-
-Restart=always
-RestartSec=3
+ExecStart=/opt/mem-bridge/venv/bin/uvicorn server:app \
+    --host 127.0.0.1 \
+    --port 8765 \
+    --no-access-log
+Restart=on-failure
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
