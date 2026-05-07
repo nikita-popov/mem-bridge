@@ -1,14 +1,16 @@
 """MCP server via Streamable HTTP transport.
 
-Auth is injected as a Starlette middleware so the FastMCP Starlette app
-(including its lifespan / session_manager.run()) is used as-is.
-Wrapping the ASGI callable directly breaks lifespan events.
+We wrap the FastMCP Starlette app with a minimal pure-ASGI shim that:
+  - forwards lifespan events unchanged (so session_manager.run() works)
+  - checks Bearer auth on HTTP requests before delegating
+
+Do NOT use BaseHTTPMiddleware or patch middleware_stack — both break
+lifespan propagation in Starlette.
 """
 from typing import Any
 from mcp.server.fastmcp import FastMCP
 from mcp.server.streamable_http import TransportSecuritySettings
-from starlette.middleware import Middleware
-from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.types import ASGIApp, Receive, Scope, Send
 from starlette.requests import Request
 from starlette.responses import Response
 from app import mempalace as mp
@@ -34,25 +36,6 @@ else:
             + [f"https://{h}" for h in extra]
             + [f"http://{h}" for h in extra],
     )
-
-
-# ── auth middleware ────────────────────────────────────────────────────────────
-
-class BearerAuthMiddleware(BaseHTTPMiddleware):
-    """Reject requests without a valid Bearer token.
-
-    Skipped when VALID_TOKENS is empty (open access / no tokens file).
-    """
-
-    async def dispatch(self, request: Request, call_next: Any) -> Response:
-        if not VALID_TOKENS:
-            return await call_next(request)
-        auth = request.headers.get("Authorization", "")
-        if not auth.startswith("Bearer "):
-            return Response("missing bearer token", status_code=401)
-        if auth[7:].strip() not in VALID_TOKENS:
-            return Response("invalid token", status_code=403)
-        return await call_next(request)
 
 
 # ── FastMCP instance ─────────────────────────────────────────────────────────────────
@@ -121,19 +104,45 @@ def status() -> dict[str, Any]:
     return mp.status().as_dict()
 
 
-# ── build the final ASGI app ────────────────────────────────────────────────────
-# streamable_http_app() returns a Starlette app with lifespan wired up.
-# We add BearerAuthMiddleware on top via Starlette middleware injection
-# so lifespan events reach the inner app correctly.
+# ── pure-ASGI auth shim ──────────────────────────────────────────────────────────
 
-def build_mcp_app() -> Any:
-    """Return the FastMCP Starlette app with auth middleware added."""
-    starlette_app = mcp.streamable_http_app()
-    # Inject auth middleware by rebuilding middleware stack
-    starlette_app.middleware_stack = BearerAuthMiddleware(
-        app=starlette_app.middleware_stack,
-    )
-    return starlette_app
+class _AuthShim:
+    """Thin ASGI wrapper around an inner app.
+
+    - lifespan events  → forwarded directly, no auth check
+    - http events      → Bearer token checked first; 401/403 if invalid
+    """
+
+    def __init__(self, inner: ASGIApp) -> None:
+        self._inner = inner
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or not VALID_TOKENS:
+            # Pass lifespan + websocket scopes straight through.
+            # Also skip auth when no tokens are configured.
+            await self._inner(scope, receive, send)
+            return
+
+        # Check Bearer token before touching the inner app.
+        headers = dict(scope.get("headers", []))
+        auth = headers.get(b"authorization", b"").decode()
+        if not auth.startswith("Bearer "):
+            await _deny(scope, send, 401, b"missing bearer token")
+            return
+        if auth[7:].strip() not in VALID_TOKENS:
+            await _deny(scope, send, 403, b"invalid token")
+            return
+
+        await self._inner(scope, receive, send)
 
 
-mcp_app = build_mcp_app()
+async def _deny(scope: Scope, send: Send, status: int, body: bytes) -> None:
+    await send({"type": "http.response.start", "status": status,
+                "headers": [[b"content-type", b"text/plain"],
+                             [b"content-length", str(len(body)).encode()]]})
+    await send({"type": "http.response.body", "body": body, "more_body": False})
+
+
+# Exported app: FastMCP Starlette app wrapped with auth shim.
+# The Starlette app retains its own lifespan; the shim is transparent to it.
+mcp_app: ASGIApp = _AuthShim(mcp.streamable_http_app())
