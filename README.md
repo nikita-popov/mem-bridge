@@ -1,24 +1,45 @@
 # mem-bridge
 
 Lightweight HTTP bridge that exposes a local [MemPalace](https://github.com/MemPalace/mempalace)
-instance as a REST API.
+instance as both an MCP server and a REST API.
 
 Runs as an unprivileged system user under systemd, behind an nginx reverse proxy.
-Works with any HTTP client that supports Bearer token authentication — Perplexity,
-Cursor, custom scripts, etc.
+Works with any MCP client that supports **Streamable HTTP transport** —
+Perplexity, Cursor, Claude Desktop, custom scripts, etc.
 
 ## Stack
 
-- **FastAPI** – request handling
-- **Gunicorn + gevent** – production server
+- **FastAPI** – REST API and app container
+- **FastMCP** (`mcp[cli]`) – MCP Streamable HTTP transport
+- **Gunicorn + UvicornWorker** – production ASGI server
 - **pydantic-settings** – configuration via environment variables / `.env`
 - **MemPalace CLI** – invoked as a subprocess; `--palace` path is explicit
+
+## Endpoints
+
+| Path | Description |
+|---|---|
+| `GET /healthz` | Health check (no auth) |
+| `POST /mcp/` | MCP Streamable HTTP – connect MCP clients here |
+| `GET /api/status` | REST: MemPalace status |
+| `POST /api/search` | REST: semantic search |
+| `POST /api/mine` | REST: store memories |
+| `POST /api/recall` | REST: recall by topic |
+
+Interactive REST docs: `http://127.0.0.1:8765/docs` (local only by default).
+
+## Connecting Perplexity
+
+1. Open **Account settings → Connectors → + Custom connector**
+2. Choose **Remote**
+3. MCP Server URL: `https://your-domain/mem-bridge/mcp/`
+4. Transport: **Streamable HTTP**
+5. Auth: **API Key** → paste a token from your tokens file
 
 ## Configuration
 
 All settings are controlled by environment variables prefixed `MEMBRIDGE_`.
-You can set them in the systemd `EnvironmentFile` (`/etc/mem-bridge/env` by default)
-or in a `.env` file in the working directory.
+Set them in `/etc/mem-bridge/env` (systemd `EnvironmentFile`) or in `.env`.
 
 See [`.env.example`](.env.example) for all available variables:
 
@@ -47,13 +68,7 @@ bash mem-bridge/deploy/install.sh \
   --palace /data/mempalace/palace
 ```
 
-The installer will:
-1. Create the system user (if absent)
-2. Create directories and config files
-3. Bootstrap a Python virtualenv and install dependencies + `mempalace`
-4. Register and start the `mem-bridge.service` systemd unit
-
-After installation, add bearer tokens to the tokens file and restart:
+After installation, add bearer tokens and restart:
 
 ```bash
 echo 'your-secret-token' >> /etc/mem-bridge/tokens
@@ -62,49 +77,11 @@ systemctl restart mem-bridge
 
 ## Nginx
 
-Include `deploy/nginx-location.conf` in your HTTPS server block,
-adjusting the subpath (`/mem-bridge/`) as needed:
-
-```nginx
-include /path/to/mem-bridge/deploy/nginx-location.conf;
-```
-
-Then test and reload:
+Include `deploy/nginx-location.conf` in your HTTPS server block:
 
 ```bash
+include /path/to/mem-bridge/deploy/nginx-location.conf;
 nginx -t && systemctl reload nginx
-```
-
-## API
-
-All endpoints except `/healthz` require `Authorization: Bearer <token>`.
-
-| Method | Path | Description |
-|---|---|---|
-| GET | `/healthz` | Health check (no auth) |
-| GET | `/api/status` | MemPalace palace status |
-| POST | `/api/search` | Semantic search |
-| POST | `/api/mine` | Mine new memories from text |
-| POST | `/api/recall` | Recall by topic |
-
-Interactive docs: `http://127.0.0.1:8765/docs` (local only by default).
-
-### POST /api/search
-
-```json
-{ "query": "nginx configuration", "wing": null, "room": null }
-```
-
-### POST /api/mine
-
-```json
-{ "source": "Deployed mem-bridge on Debian today.", "wing": null }
-```
-
-### POST /api/recall
-
-```json
-{ "topic": "infrastructure", "limit": 10 }
 ```
 
 ## Local development
@@ -116,10 +93,19 @@ cp .env.example .env   # edit as needed
 uvicorn app.main:app --reload
 ```
 
+## Updating
+
+```bash
+cd /opt/mem-bridge
+git pull
+/opt/mem-bridge/venv/bin/pip install -q -r requirements.txt
+systemctl restart mem-bridge
+```
+
 ## Tokens
 
-Tokens are loaded once at process start. To add or revoke a token,
-edit the tokens file and restart the service:
+Tokens are loaded once at process start.
+To add or revoke a token, edit the file and restart:
 
 ```bash
 echo 'newtoken' >> /etc/mem-bridge/tokens

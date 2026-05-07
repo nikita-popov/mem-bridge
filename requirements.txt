@@ -2,4 +2,5 @@ fastapi>=0.111.0
 pydantic>=2.7
 pydantic-settings>=2.3
 gunicorn>=22.0
-uvicorn[standard]>=0.29  # provides UvicornWorker for gunicorn
+uvicorn[standard]>=0.29
+mcp[cli]>=1.6
