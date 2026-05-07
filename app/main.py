@@ -1,31 +1,38 @@
 """ASGI entry point.
 
-Architecture:
-  /           → MCP Streamable HTTP (FastMCP)
-  /healthz    → health check (no auth)
-  /api/*      → REST endpoints (Bearer auth)
+Routing:
+  GET  /healthz  → health check (no auth)
+  *    /api/*    → REST endpoints (Bearer auth checked inside routes.py)
+  *    /*        → MCP Streamable HTTP (auth inside mcp_handler)
 
-We build a Starlette Router that adds /healthz and /api/* on top of the
-MCP app, which handles everything else (POST /, GET /, OPTIONS /, ...).
-This avoids app.mount() path-stripping issues.
+Lifespan starts the FastMCP session_manager task group.
 """
+import contextlib
+
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route, Mount
-from starlette.middleware import Middleware
+
+from app.mcp_server import mcp_lifespan, mcp_handler
 from app.routes import build_rest_router
-from app.mcp_server import mcp_app
 
 
 async def healthz(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True})
 
 
+@contextlib.asynccontextmanager
+async def lifespan(app: Starlette):
+    async with mcp_lifespan():
+        yield
+
+
 app = Starlette(
+    lifespan=lifespan,
     routes=[
         Route("/healthz", healthz, methods=["GET"]),
         Mount("/api", app=build_rest_router()),
-        Mount("/", app=mcp_app),
+        Mount("/", app=mcp_handler),
     ],
 )
