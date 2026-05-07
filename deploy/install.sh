@@ -10,6 +10,7 @@
 #   --dir     PATH   Installation directory                    (default: /opt/mem-bridge)
 #   --conf    PATH   Directory for config/token files          (default: /etc/mem-bridge)
 #   --palace  PATH   Path to MemPalace palace directory        (default: <dir>/.mempalace/palace)
+#   --host    HOST   External hostname for MCP access          (default: empty)
 #   --help           Show this help and exit
 
 set -euo pipefail
@@ -18,7 +19,8 @@ set -euo pipefail
 SVC_USER="mem-bridge"
 INSTALL_DIR="/opt/mem-bridge"
 CONF_DIR="/etc/mem-bridge"
-PALACE_PATH=""  # derived from INSTALL_DIR below if empty
+PALACE_PATH=""
+ALLOWED_HOST=""
 
 # ── argument parsing ──────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -27,8 +29,9 @@ while [[ $# -gt 0 ]]; do
         --dir)    INSTALL_DIR="$2"; shift 2 ;;
         --conf)   CONF_DIR="$2";    shift 2 ;;
         --palace) PALACE_PATH="$2"; shift 2 ;;
+        --host)   ALLOWED_HOST="$2"; shift 2 ;;
         --help)
-            sed -n '3,20p' "$0"
+            sed -n '3,21p' "$0"
             exit 0
             ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
@@ -44,10 +47,11 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.."; pwd)"
 UNIT_DST="/etc/systemd/system/mem-bridge.service"
 
 echo "==> Configuration"
-echo "    user:        $SVC_USER"
-echo "    install dir: $INSTALL_DIR"
-echo "    conf dir:    $CONF_DIR"
-echo "    palace:      $PALACE_PATH"
+echo "    user:         $SVC_USER"
+echo "    install dir:  $INSTALL_DIR"
+echo "    conf dir:     $CONF_DIR"
+echo "    palace:       $PALACE_PATH"
+echo "    allowed host: ${ALLOWED_HOST:-'(localhost only)'}"
 echo
 
 # ── system user ───────────────────────────────────────────────────────────────
@@ -71,6 +75,7 @@ MEMBRIDGE_MEMPALACE_BIN=$VENV/bin/mempalace
 MEMBRIDGE_TOKENS_FILE=$TOKENS_FILE
 MEMBRIDGE_BIND=127.0.0.1:8765
 MEMBRIDGE_WORKERS=1
+MEMBRIDGE_ALLOWED_HOSTS=$ALLOWED_HOST
 EOF
     chown "$SVC_USER:$SVC_USER" "$ENV_FILE"
     chmod 640 "$ENV_FILE"
