@@ -7,11 +7,9 @@ Starlette does NOT propagate lifespan into Mount()-ed sub-apps, so
 mcp.streamable_http_app() used as Mount target will never start the
 session_manager task group → RuntimeError on first request.
 
-Correct approach:
-  1. Create StreamableHTTPSessionManager from mcp._mcp_server directly.
-  2. Start it in the outer app lifespan via `async with session_manager.run()`.
-  3. Expose a plain ASGI callable (handler) that calls handle_request.
-  4. Wrap with a pure-ASGI auth shim (lifespan-transparent).
+stateless=True: each HTTP request is an independent MCP session.
+Required when running multiple gunicorn workers (session state lives
+in process memory and cannot be shared across workers).
 """
 from typing import Any
 import contextlib
@@ -19,7 +17,7 @@ import contextlib
 from mcp.server.fastmcp import FastMCP
 from mcp.server.streamable_http import TransportSecuritySettings
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import Receive, Scope, Send
 
 from app import mempalace as mp
 from app.auth import VALID_TOKENS
@@ -81,30 +79,27 @@ def status() -> dict[str, Any]:
     return mp.status().as_dict()
 
 
-# ── session manager (lifespan managed by outer app) ───────────────────────────
+# ── session manager ──────────────────────────────────────────────────────────────
+# stateless=True: every POST is a self-contained MCP exchange.
+# This is required with multiple gunicorn workers because session state
+# lives in process memory and cannot be shared between workers.
+# If you ever need stateful sessions (streaming), set MEMBRIDGE_WORKERS=1.
 
 session_manager = StreamableHTTPSessionManager(
     app=mcp._mcp_server,
     event_store=None,
     json_response=False,
-    stateless=False,
+    stateless=True,
 )
 
 
 @contextlib.asynccontextmanager
 async def mcp_lifespan():
-    """Start/stop the session manager task group.
-
-    Call this from the outer Starlette app lifespan:
-
-        async with mcp_lifespan():
-            yield
-    """
     async with session_manager.run():
         yield
 
 
-# ── pure-ASGI auth shim ───────────────────────────────────────────────────────
+# ── ASGI handler ───────────────────────────────────────────────────────────────────
 
 async def _deny(send: Send, status: int, body: bytes) -> None:
     await send({"type": "http.response.start", "status": status,
@@ -114,7 +109,6 @@ async def _deny(send: Send, status: int, body: bytes) -> None:
 
 
 async def mcp_handler(scope: Scope, receive: Receive, send: Send) -> None:
-    """Auth-checked MCP ASGI handler.  Mount this at '/' in the outer router."""
     if scope["type"] == "http" and VALID_TOKENS:
         headers = dict(scope.get("headers", []))
         auth = headers.get(b"authorization", b"").decode()
