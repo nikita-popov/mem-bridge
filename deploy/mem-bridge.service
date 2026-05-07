@@ -1,0 +1,27 @@
+[Unit]
+Description=mem-bridge – HTTP bridge to MemPalace
+After=network.target
+
+[Service]
+User=chatd
+Group=chatd
+WorkingDirectory=/opt/chatd/mem-bridge
+Environment=PATH=/opt/chatd/venv/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+# Override any setting via environment:
+# Environment=MEMBRIDGE_PALACE_PATH=/opt/chatd/.mempalace/palace
+# Environment=MEMBRIDGE_TOKENS_FILE=/opt/chatd/etc/mempalace.tokens
+ExecStart=/opt/chatd/venv/bin/gunicorn \
+    -k gevent \
+    -w 1 \
+    -b 127.0.0.1:8765 \
+    --timeout 120 \
+    --keep-alive 5 \
+    --access-logfile - \
+    --error-logfile - \
+    app.main:app
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
