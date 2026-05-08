@@ -19,6 +19,7 @@ no hardcoded tool list.
 """
 import asyncio
 import contextlib
+import inspect
 import json
 import logging
 import os
@@ -35,6 +36,7 @@ from mcp.client.stdio import stdio_client
 from mcp.server.fastmcp import FastMCP
 from mcp.server.streamable_http import TransportSecuritySettings
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from mcp.types import Tool as MCPTool
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
@@ -102,9 +104,7 @@ else:
 # ── MCPClient (from chatd/mcp_client.py, adapted) ─────────────────────────────
 #
 # Runs its own asyncio event loop in a dedicated daemon thread so it never
-# conflicts with the uvicorn event loop.  All public methods are synchronous
-# and safe to call from any thread (including async contexts via
-# asyncio.get_event_loop().run_in_executor).
+# conflicts with the uvicorn event loop.
 
 MCP_LIST_TOOLS_TIMEOUT: float = float(os.environ.get("MEMBRIDGE_LIST_TOOLS_TIMEOUT", "30"))
 MCP_CALL_TOOL_TIMEOUT: float = float(os.environ.get("MEMBRIDGE_CALL_TOOL_TIMEOUT", "60"))
@@ -125,13 +125,7 @@ def _kill_process(cmd: list[str]) -> None:
 
 
 class MCPClient:
-    """Long-lived stdio MCP client with its own event loop in a daemon thread.
-
-    start() spawns the thread and blocks until the session is ready (or raises).
-    stop() schedules cleanup and joins the thread.
-    list_tools() / call_tool() submit coroutines to the thread's loop and
-    block the calling thread until done — safe to call from sync or async code.
-    """
+    """Long-lived stdio MCP client with its own event loop in a daemon thread."""
 
     def __init__(self, cmd: list[str]):
         self.cmd = cmd
@@ -139,14 +133,11 @@ class MCPClient:
         self._stack: AsyncExitStack | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
-        self._ready = threading.Event()   # set when session.initialize() done
+        self._ready = threading.Event()
         self._start_exc: BaseException | None = None
         self._lock = threading.Lock()
 
-    # ── internal ──────────────────────────────────────────────────────────────
-
     async def _run_loop(self) -> None:
-        """Entry point for the daemon thread's event loop."""
         try:
             self._stack = AsyncExitStack()
             read, write = await self._stack.enter_async_context(
@@ -160,13 +151,12 @@ class MCPClient:
             await self._session.initialize()
             log.info("[mcp] started: %s", self.cmd)
             self._ready.set()
-            # Keep the loop alive until stop() cancels the task.
-            await asyncio.get_running_loop().create_future()
+            await asyncio.get_running_loop().create_future()  # park until cancelled
         except asyncio.CancelledError:
             pass
         except Exception as exc:
             self._start_exc = exc
-            self._ready.set()   # unblock start() so it can raise
+            self._ready.set()
         finally:
             if self._stack:
                 try:
@@ -186,10 +176,7 @@ class MCPClient:
             self._loop.close()
             self._loop = None
 
-    # ── lifecycle ─────────────────────────────────────────────────────────────
-
     def start(self) -> None:
-        """Spawn thread, wait for session ready. Raises on failure."""
         self._thread = threading.Thread(target=self._thread_main, daemon=True, name="mcp-client")
         self._thread.start()
         self._ready.wait(timeout=MCP_LIST_TOOLS_TIMEOUT)
@@ -199,7 +186,6 @@ class MCPClient:
             raise RuntimeError(f"MCPClient failed to start: {self.cmd}")
 
     def stop(self) -> None:
-        """Cancel the main task and stop the loop."""
         if self._loop and self._loop.is_running():
             self._loop.call_soon_threadsafe(self._main_task.cancel)
             self._loop.call_soon_threadsafe(self._loop.stop)
@@ -207,8 +193,6 @@ class MCPClient:
             self._thread.join(timeout=5)
         self._thread = None
         log.info("[mcp] stopped: %s", self.cmd)
-
-    # ── internal helper ───────────────────────────────────────────────────────
 
     def _run(self, coro, timeout: float) -> Any:
         if self._loop is None or self._session is None:
@@ -220,9 +204,7 @@ class MCPClient:
             )
             return future.result(timeout=timeout + 2)
 
-    # ── public API ────────────────────────────────────────────────────────────
-
-    def list_tools(self) -> list:
+    def list_tools(self) -> list[MCPTool]:
         try:
             return self._run(self._session.list_tools(), MCP_LIST_TOOLS_TIMEOUT).tools
         except (asyncio.TimeoutError, TimeoutError):
@@ -259,27 +241,79 @@ class MCPClient:
 _upstream = MCPClient(MEMPALACE_CMD)
 
 
-# ── dynamic tool registration ──────────────────────────────────────────────────
+# ── dynamic tool registration ─────────────────────────────────────────────────
+#
+# FastMCP derives the JSON schema from the Python function signature.
+# We rebuild the signature from the upstream tool's inputSchema so that
+# the correct schema is advertised to clients (Perplexity, Claude, etc.).
+#
+# JSON-schema type  →  Python annotation
+#   string          →  str
+#   integer         →  int
+#   number          →  float
+#   boolean         →  bool
+#   array           →  list
+#   object          →  dict
+#   (anything else) →  Any
+
+_JSON_TYPE_MAP: dict[str, Any] = {
+    "string": str,
+    "integer": int,
+    "number": float,
+    "boolean": bool,
+    "array": list,
+    "object": dict,
+}
+
+
+def _build_signature(tool: MCPTool) -> inspect.Signature:
+    """Return an inspect.Signature matching the tool's inputSchema."""
+    schema: dict = tool.inputSchema if isinstance(tool.inputSchema, dict) else {}
+    properties: dict = schema.get("properties") or {}
+    required: set[str] = set(schema.get("required") or [])
+
+    params: list[inspect.Parameter] = []
+    for param_name, param_schema in properties.items():
+        annotation = _JSON_TYPE_MAP.get(
+            param_schema.get("type", "") if isinstance(param_schema, dict) else "",
+            Any,
+        )
+        if param_name in required:
+            default = inspect.Parameter.empty
+        else:
+            default = param_schema.get("default", None) if isinstance(param_schema, dict) else None
+        params.append(
+            inspect.Parameter(
+                name=param_name,
+                kind=inspect.Parameter.KEYWORD_ONLY,
+                default=default,
+                annotation=annotation,
+            )
+        )
+    return inspect.Signature(params)
+
 
 mcp = FastMCP("mem-bridge", transport_security=_security)
 
 
 def _register_tools() -> None:
-    """Discover all tools from upstream and register them as FastMCP tools."""
     tools = _upstream.list_tools()
     log.info("[mcp] registering %d tool(s): %s", len(tools), [t.name for t in tools])
     for tool in tools:
-        _make_tool(tool.name, tool.description or "")
+        _make_tool(tool)
 
 
-def _make_tool(name: str, description: str) -> None:
-    """Dynamically create and register one passthrough tool."""
+def _make_tool(tool: MCPTool) -> None:
+    """Build a passthrough handler with a proper signature and register it."""
+    name = tool.name
+    sig = _build_signature(tool)
 
     def _handler(**kwargs: Any) -> Any:
         return _upstream.call_tool(name, kwargs)
 
     _handler.__name__ = name
-    _handler.__doc__ = description
+    _handler.__doc__ = tool.description or ""
+    _handler.__signature__ = sig  # FastMCP reads this to build the JSON schema
     mcp.tool()(_handler)
 
 
