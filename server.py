@@ -27,6 +27,7 @@ import shlex
 import signal
 import subprocess
 import threading
+import time
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
@@ -101,7 +102,7 @@ else:
     )
 
 
-# ── MCPClient (from chatd/mcp_client.py, adapted) ─────────────────────────────
+# ── MCPClient ─────────────────────────────────────────────────────────────────────────
 #
 # Runs its own asyncio event loop in a dedicated daemon thread so it never
 # conflicts with the uvicorn event loop.
@@ -212,6 +213,7 @@ class MCPClient:
             raise RuntimeError(f"list_tools timeout ({MCP_LIST_TOOLS_TIMEOUT:.0f}s)")
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        """Call upstream tool. Raises RuntimeError on timeout or upstream error."""
         try:
             result = self._run(
                 self._session.call_tool(name, arguments=arguments),
@@ -219,7 +221,16 @@ class MCPClient:
             )
         except (asyncio.TimeoutError, TimeoutError):
             _kill_process(self.cmd)
-            raise RuntimeError(f"call_tool timeout ({MCP_CALL_TOOL_TIMEOUT:.0f}s): {name}")
+            raise RuntimeError(f"upstream timeout ({MCP_CALL_TOOL_TIMEOUT:.0f}s): {name}")
+
+        # Upstream returned an explicit isError result
+        if getattr(result, "isError", False):
+            contents = getattr(result, "content", None) or []
+            text = ""
+            if contents:
+                first = contents[0]
+                text = getattr(first, "text", None) or (first.get("text") if isinstance(first, dict) else "") or ""
+            raise RuntimeError(f"upstream error in {name}: {text}")
 
         contents = getattr(result, "content", None) or []
         if not contents:
@@ -245,7 +256,7 @@ _upstream = MCPClient(MEMPALACE_CMD)
 #
 # FastMCP derives the JSON schema from the Python function signature.
 # We rebuild the signature from the upstream tool's inputSchema so that
-# the correct schema is advertised to clients (Perplexity, Claude, etc.).
+# the correct schema is advertised to MCP clients.
 #
 # JSON-schema type  →  Python annotation
 #   string          →  str
@@ -309,11 +320,21 @@ def _make_tool(tool: MCPTool) -> None:
     sig = _build_signature(tool)
 
     def _handler(**kwargs: Any) -> Any:
-        return _upstream.call_tool(name, kwargs)
+        t0 = time.monotonic()
+        try:
+            result = _upstream.call_tool(name, kwargs)
+            ms = (time.monotonic() - t0) * 1000
+            log.info("[tool] %s → ok  %.0fms", name, ms)
+            return result
+        except RuntimeError as exc:
+            ms = (time.monotonic() - t0) * 1000
+            log.error("[tool] %s → error  %.0fms  %s", name, ms, exc)
+            # Re-raise so FastMCP converts it to a proper JSON-RPC error response
+            raise
 
     _handler.__name__ = name
     _handler.__doc__ = tool.description or ""
-    _handler.__signature__ = sig  # FastMCP reads this to build the JSON schema
+    _handler.__signature__ = sig
     mcp.tool()(_handler)
 
 
@@ -327,7 +348,7 @@ session_manager = StreamableHTTPSessionManager(
 )
 
 
-# ── auth middleware + MCP handler ─────────────────────────────────────────────
+# ── auth middleware + request logging + MCP handler ────────────────────────────
 
 async def _deny(send: Send, code: int, msg: bytes) -> None:
     await send({"type": "http.response.start", "status": code,
@@ -336,17 +357,66 @@ async def _deny(send: Send, code: int, msg: bytes) -> None:
     await send({"type": "http.response.body", "body": msg, "more_body": False})
 
 
+def _peek_mcp_method(body: bytes) -> str:
+    """Extract method (and optional tool name) from a JSON-RPC body for logging."""
+    try:
+        data = json.loads(body)
+        method: str = data.get("method", "")
+        # tools/call carries the tool name in params.name
+        if method == "tools/call":
+            tool_name = (data.get("params") or {}).get("name", "")
+            return f"{method} {tool_name}" if tool_name else method
+        return method
+    except Exception:
+        return "(invalid json)"
+
+
+async def _buffered_receive(body: bytes):
+    """Return a receive callable that replays the already-read body."""
+    consumed = False
+
+    async def _receive() -> dict:
+        nonlocal consumed
+        if not consumed:
+            consumed = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        # Subsequent calls park (connection already handled)
+        await asyncio.sleep(3600)
+        return {"type": "http.disconnect"}
+
+    return _receive
+
+
 async def mcp_handler(scope: Scope, receive: Receive, send: Send) -> None:
-    if scope["type"] == "http" and TOKENS:
+    if scope["type"] != "http":
+        await session_manager.handle_request(scope, receive, send)
+        return
+
+    # ─ auth ───────────────────────────────────────────────────────────────
+    if TOKENS:
         headers = dict(scope.get("headers", []))
         auth = headers.get(b"authorization", b"").decode()
         if not auth.startswith("Bearer "):
+            log.warning("[auth] 401 missing token  path=%s", scope.get("path", "/"))
             await _deny(send, 401, b"missing bearer token")
             return
         if auth[7:].strip() not in TOKENS:
+            log.warning("[auth] 403 invalid token  path=%s", scope.get("path", "/"))
             await _deny(send, 403, b"invalid token")
             return
-    await session_manager.handle_request(scope, receive, send)
+
+    # ─ read body once for logging, then replay ───────────────────────────────
+    # Only buffer for POST (tool calls). GET/OPTIONS pass through untouched.
+    method = scope.get("method", "").upper()
+    if method == "POST":
+        msg = await receive()
+        body: bytes = msg.get("body", b"")
+        mcp_method = _peek_mcp_method(body)
+        log.info("[req]  %s  %s", method, mcp_method)
+        replayed_receive = await _buffered_receive(body)
+        await session_manager.handle_request(scope, replayed_receive, send)
+    else:
+        await session_manager.handle_request(scope, receive, send)
 
 
 # ── Starlette app + lifespan ──────────────────────────────────────────────────
