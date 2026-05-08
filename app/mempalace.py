@@ -1,54 +1,124 @@
-"""Thin synchronous wrapper around the mempalace CLI."""
+"""Persistent stdio MCP subprocess backend.
+
+Spawns `python -m mempalace.mcp_server` once and keeps it alive.
+Each public function sends one MCP JSON-RPC `tools/call` request over
+stdin and reads the response from stdout — no process spawn per call.
+
+Thread-safety: a threading.Lock serialises all stdin/stdout I/O so the
+module is safe to use from multiple asyncio threads (gunicorn sync workers
+or anyio thread-pool tasks).
+"""
+from __future__ import annotations
+
+import json
 import subprocess
-from dataclasses import dataclass
+import threading
+import sys
+from typing import Any
+
 from app.config import settings
 
 
-@dataclass
-class CmdResult:
-    returncode: int
-    stdout: str
-    stderr: str
+# ── subprocess lifecycle ──────────────────────────────────────────────────────
+
+_lock = threading.Lock()
+_proc: subprocess.Popen | None = None
+_req_id = 0
+
+
+def _start_proc() -> subprocess.Popen:
+    cmd = [
+        settings.mempalace_python,
+        "-m", settings.mempalace_module,
+    ]
+    if settings.palace_path:
+        cmd += ["--palace", settings.palace_path]
+    return subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=sys.stderr,   # forward mempalace logs to our stderr
+        text=True,
+        bufsize=1,           # line-buffered
+    )
+
+
+def _get_proc() -> subprocess.Popen:
+    global _proc
+    if _proc is None or _proc.poll() is not None:
+        _proc = _start_proc()
+    return _proc
+
+
+# ── JSON-RPC helpers ──────────────────────────────────────────────────────────
+
+def _rpc(method: str, params: dict) -> dict[str, Any]:
+    """Send one JSON-RPC request, return the result dict.
+
+    Raises RuntimeError on protocol errors or non-zero exit.
+    """
+    global _req_id
+    with _lock:
+        proc = _get_proc()
+        _req_id += 1
+        req = json.dumps({
+            "jsonrpc": "2.0",
+            "id": _req_id,
+            "method": method,
+            "params": params,
+        })
+        try:
+            proc.stdin.write(req + "\n")
+            proc.stdin.flush()
+            raw = proc.stdout.readline()
+        except (BrokenPipeError, OSError):
+            # Backend crashed; restart on next call
+            _proc = None
+            raise RuntimeError("mempalace subprocess died; restarting on next call")
+
+    if not raw:
+        raise RuntimeError("mempalace subprocess closed stdout")
+
+    resp = json.loads(raw)
+    if "error" in resp:
+        raise RuntimeError(f"mempalace error: {resp['error']}")
+    return resp.get("result", {})
+
+
+def _call(tool: str, arguments: dict) -> dict[str, Any]:
+    return _rpc("tools/call", {"name": tool, "arguments": arguments})
+
+
+# ── public API (mirrors old CmdResult interface) ──────────────────────────────
+
+class MCPResult:
+    """Thin wrapper so callers can do .as_dict() like before."""
+    def __init__(self, data: dict):
+        self._data = data
 
     def as_dict(self) -> dict:
-        return {
-            "returncode": self.returncode,
-            "stdout": self.stdout,
-            "stderr": self.stderr,
-        }
+        return self._data
 
 
-def _run(*args: str, timeout: int = 120) -> CmdResult:
-    cmd = [settings.mempalace_bin, *settings.palace_args(), *args]
-    proc = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=False,
-    )
-    return CmdResult(proc.returncode, proc.stdout, proc.stderr)
+def status() -> MCPResult:
+    return MCPResult(_call("status", {}))
 
 
-def status() -> CmdResult:
-    return _run("status", timeout=30)
-
-
-def search(query: str, wing: str | None = None, room: str | None = None) -> CmdResult:
-    extra: list[str] = []
+def search(query: str, wing: str | None = None, room: str | None = None) -> MCPResult:
+    args: dict = {"query": query}
     if wing:
-        extra += ["--wing", wing]
+        args["wing"] = wing
     if room:
-        extra += ["--room", room]
-    return _run("search", query, *extra)
+        args["room"] = room
+    return MCPResult(_call("search", args))
 
 
-def mine(source: str, wing: str | None = None) -> CmdResult:
-    extra: list[str] = []
+def mine(source: str, wing: str | None = None) -> MCPResult:
+    args: dict = {"source": source}
     if wing:
-        extra += ["--wing", wing]
-    return _run("mine", source, *extra)
+        args["wing"] = wing
+    return MCPResult(_call("mine", args))
 
 
-def recall(topic: str, limit: int = 10) -> CmdResult:
-    return _run("recall", topic, "--limit", str(limit))
+def recall(topic: str, limit: int = 10) -> MCPResult:
+    return MCPResult(_call("recall", {"topic": topic, "limit": limit}))

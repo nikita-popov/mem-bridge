@@ -8,11 +8,12 @@ class Settings(BaseSettings):
     Example .env file or EnvironmentFile in systemd unit:
 
         MEMBRIDGE_PALACE_PATH=/home/alice/.mempalace/palace
-        MEMBRIDGE_MEMPALACE_BIN=/home/alice/.local/bin/mempalace
+        MEMBRIDGE_MEMPALACE_PYTHON=/home/alice/.venv/bin/python
+        MEMBRIDGE_MEMPALACE_MODULE=mempalace.mcp_server
         MEMBRIDGE_TOKENS_FILE=/etc/mem-bridge/tokens
         MEMBRIDGE_BIND=127.0.0.1:8765
         MEMBRIDGE_WORKERS=1
-        MEMBRIDGE_ALLOWED_HOSTS=chat.example.com,example.com
+        MEMBRIDGE_ALLOWED_HOSTS=chat.example.com
     """
 
     model_config = SettingsConfigDict(
@@ -25,29 +26,26 @@ class Settings(BaseSettings):
     # Path to the MemPalace palace directory
     palace_path: str = ""
 
-    # Path to the mempalace binary
-    mempalace_bin: str = "mempalace"
+    # Python interpreter that has mempalace installed
+    mempalace_python: str = "python"
+
+    # Module to run as the stdio MCP backend
+    mempalace_module: str = "mempalace.mcp_server"
 
     # File containing bearer tokens, one per line; lines starting with # are ignored
     tokens_file: Path = Path("/etc/mem-bridge/tokens")
 
-    # Gunicorn bind address
+    # Uvicorn / gunicorn bind address
     bind: str = "127.0.0.1:8765"
 
-    # Number of gunicorn workers (1 recommended for SQLite-backed MemPalace)
+    # Number of workers (keep 1: the stdio subprocess is per-process)
     workers: int = 1
 
-    # Comma-separated list of external hostnames that are allowed to connect.
+    # Comma-separated external hostnames allowed to connect.
     # FastMCP blocks non-localhost hosts by default (DNS rebinding protection).
     # Set to the public hostname of your reverse proxy, e.g. "chat.example.com".
-    # Set to "*" to disable the check entirely (not recommended on public servers).
+    # Set to "*" to disable the check entirely (not recommended).
     allowed_hosts: str = ""
-
-    def palace_args(self) -> list[str]:
-        """Return --palace <path> args if palace_path is set."""
-        if self.palace_path:
-            return ["--palace", self.palace_path]
-        return []
 
     def extra_allowed_hosts(self) -> list[str]:
         if not self.allowed_hosts:
