@@ -1,22 +1,21 @@
-"""Minimal MCP HTTP bridge for MemPalace.
+"""Minimal MCP Streamable HTTP bridge for MemPalace.
 
 Usage:
     uvicorn server:app
 
-Env vars:
-    TOKENS_FILE   path to bearer tokens file (one per line)  [/etc/mem-bridge/tokens]
-    PALACE_PATH   path to mempalace palace directory         [mempalace default]
-    ALLOWED_HOSTS comma-separated external hostnames         [localhost only]
+Env vars (all optional, prefix MEMBRIDGE_):
+    MEMBRIDGE_TOKENS_FILE   path to bearer tokens file  [/etc/mem-bridge/tokens]
+    MEMBRIDGE_PALACE_PATH   path to mempalace palace dir [mempalace default]
+    MEMBRIDGE_ALLOWED_HOSTS comma-separated external hostnames [localhost only]
 """
 import os
 import contextlib
-from typing import Any
+from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.streamable_http import TransportSecuritySettings
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.applications import Starlette
-from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route, Mount
 from starlette.types import Receive, Scope, Send
@@ -24,10 +23,21 @@ from starlette.types import Receive, Scope, Send
 import mempalace as mp
 
 
+# ── dotenv (optional) ─────────────────────────────────────────────────────────
+
+_env_file = Path(".env")
+if _env_file.exists():
+    for _line in _env_file.read_text().splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _, _v = _line.partition("=")
+            os.environ.setdefault(_k.strip(), _v.strip())
+
+
 # ── config ────────────────────────────────────────────────────────────────────
 
 def _load_tokens() -> frozenset[str]:
-    path = os.environ.get("TOKENS_FILE", "/etc/mem-bridge/tokens")
+    path = os.environ.get("MEMBRIDGE_TOKENS_FILE", "/etc/mem-bridge/tokens")
     try:
         with open(path) as f:
             return frozenset(
@@ -42,7 +52,7 @@ TOKENS = _load_tokens()
 
 _extra_hosts = [
     h.strip()
-    for h in os.environ.get("ALLOWED_HOSTS", "").split(",")
+    for h in os.environ.get("MEMBRIDGE_ALLOWED_HOSTS", "").split(",")
     if h.strip()
 ]
 
@@ -99,7 +109,7 @@ session_manager = StreamableHTTPSessionManager(
 )
 
 
-# ── auth + MCP handler ──────────────────────────────────────────────────────────
+# ── auth + MCP handler ────────────────────────────────────────────────────────
 
 async def _deny(send: Send, code: int, msg: bytes) -> None:
     await send({"type": "http.response.start", "status": code,
@@ -121,7 +131,7 @@ async def mcp_handler(scope: Scope, receive: Receive, send: Send) -> None:
     await session_manager.handle_request(scope, receive, send)
 
 
-# ── Starlette app ─────────────────────────────────────────────────────────────────
+# ── Starlette app ─────────────────────────────────────────────────────────────
 
 @contextlib.asynccontextmanager
 async def lifespan(_app: Starlette):
