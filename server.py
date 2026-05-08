@@ -55,7 +55,7 @@ if _env_file.exists():
             os.environ.setdefault(_k.strip(), _v.strip())
 
 
-# ── config ─────────────────────────────────────────────────────────────────────
+# ── config ────────────────────────────────────────────────────────────────────
 
 MEMPALACE_CMD: list[str] = shlex.split(
     os.environ.get("MEMBRIDGE_MEMPALACE_CMD", "python -m mempalace.mcp_server")
@@ -99,7 +99,12 @@ else:
     )
 
 
-# ── MCPClient (from chatd/mcp_client.py, adapted) ──────────────────────────────────
+# ── MCPClient (from chatd/mcp_client.py, adapted) ─────────────────────────────
+#
+# Runs its own asyncio event loop in a dedicated daemon thread so it never
+# conflicts with the uvicorn event loop.  All public methods are synchronous
+# and safe to call from any thread (including async contexts via
+# asyncio.get_event_loop().run_in_executor).
 
 MCP_LIST_TOOLS_TIMEOUT: float = float(os.environ.get("MEMBRIDGE_LIST_TOOLS_TIMEOUT", "30"))
 MCP_CALL_TOOL_TIMEOUT: float = float(os.environ.get("MEMBRIDGE_CALL_TOOL_TIMEOUT", "60"))
@@ -120,59 +125,107 @@ def _kill_process(cmd: list[str]) -> None:
 
 
 class MCPClient:
-    """Long-lived stdio MCP client. start() once, stop() on shutdown."""
+    """Long-lived stdio MCP client with its own event loop in a daemon thread.
+
+    start() spawns the thread and blocks until the session is ready (or raises).
+    stop() schedules cleanup and joins the thread.
+    list_tools() / call_tool() submit coroutines to the thread's loop and
+    block the calling thread until done — safe to call from sync or async code.
+    """
 
     def __init__(self, cmd: list[str]):
         self.cmd = cmd
         self._session: ClientSession | None = None
         self._stack: AsyncExitStack | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
+        self._ready = threading.Event()   # set when session.initialize() done
+        self._start_exc: BaseException | None = None
         self._lock = threading.Lock()
 
-    async def _start_async(self) -> None:
-        self._stack = AsyncExitStack()
-        read, write = await self._stack.enter_async_context(
-            stdio_client(StdioServerParameters(
-                command=self.cmd[0], args=self.cmd[1:], env=os.environ.copy(),
-            ))
-        )
-        self._session = await self._stack.enter_async_context(ClientSession(read, write))
-        await self._session.initialize()
+    # ── internal ──────────────────────────────────────────────────────────────
+
+    async def _run_loop(self) -> None:
+        """Entry point for the daemon thread's event loop."""
+        try:
+            self._stack = AsyncExitStack()
+            read, write = await self._stack.enter_async_context(
+                stdio_client(StdioServerParameters(
+                    command=self.cmd[0], args=self.cmd[1:], env=os.environ.copy(),
+                ))
+            )
+            self._session = await self._stack.enter_async_context(
+                ClientSession(read, write)
+            )
+            await self._session.initialize()
+            log.info("[mcp] started: %s", self.cmd)
+            self._ready.set()
+            # Keep the loop alive until stop() cancels the task.
+            await asyncio.get_running_loop().create_future()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            self._start_exc = exc
+            self._ready.set()   # unblock start() so it can raise
+        finally:
+            if self._stack:
+                try:
+                    await self._stack.aclose()
+                except Exception as e:
+                    log.debug("[mcp] aclose error: %s", e)
+            self._session = None
+            self._stack = None
+
+    def _thread_main(self) -> None:
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        self._main_task = self._loop.create_task(self._run_loop())
+        try:
+            self._loop.run_forever()
+        finally:
+            self._loop.close()
+            self._loop = None
+
+    # ── lifecycle ─────────────────────────────────────────────────────────────
 
     def start(self) -> None:
-        self._loop = asyncio.new_event_loop()
-        try:
-            self._loop.run_until_complete(self._start_async())
-            log.info("[mcp] started: %s", self.cmd)
-        except Exception as e:
-            log.error("[mcp] failed to start %s: %s", self.cmd, e)
-            self._loop.close()
-            self._loop = None
-            raise
+        """Spawn thread, wait for session ready. Raises on failure."""
+        self._thread = threading.Thread(target=self._thread_main, daemon=True, name="mcp-client")
+        self._thread.start()
+        self._ready.wait(timeout=MCP_LIST_TOOLS_TIMEOUT)
+        if self._start_exc:
+            raise self._start_exc
+        if not self._session:
+            raise RuntimeError(f"MCPClient failed to start: {self.cmd}")
 
     def stop(self) -> None:
-        if self._stack and self._loop:
-            try:
-                self._loop.run_until_complete(self._stack.aclose())
-            except Exception as e:
-                log.debug("[mcp] stop aclose error: %s", e)
-        if self._loop:
-            self._loop.close()
-            self._loop = None
-        self._session = None
-        self._stack = None
+        """Cancel the main task and stop the loop."""
+        if self._loop and self._loop.is_running():
+            self._loop.call_soon_threadsafe(self._main_task.cancel)
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._thread:
+            self._thread.join(timeout=5)
+        self._thread = None
         log.info("[mcp] stopped: %s", self.cmd)
+
+    # ── internal helper ───────────────────────────────────────────────────────
 
     def _run(self, coro, timeout: float) -> Any:
         if self._loop is None or self._session is None:
             raise RuntimeError(f"MCPClient not started: {self.cmd}")
         with self._lock:
-            return self._loop.run_until_complete(asyncio.wait_for(coro, timeout=timeout))
+            future = asyncio.run_coroutine_threadsafe(
+                asyncio.wait_for(coro, timeout=timeout),
+                self._loop,
+            )
+            return future.result(timeout=timeout + 2)
+
+    # ── public API ────────────────────────────────────────────────────────────
 
     def list_tools(self) -> list:
         try:
             return self._run(self._session.list_tools(), MCP_LIST_TOOLS_TIMEOUT).tools
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, TimeoutError):
             _kill_process(self.cmd)
             raise RuntimeError(f"list_tools timeout ({MCP_LIST_TOOLS_TIMEOUT:.0f}s)")
 
@@ -182,7 +235,7 @@ class MCPClient:
                 self._session.call_tool(name, arguments=arguments),
                 MCP_CALL_TOOL_TIMEOUT,
             )
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, TimeoutError):
             _kill_process(self.cmd)
             raise RuntimeError(f"call_tool timeout ({MCP_CALL_TOOL_TIMEOUT:.0f}s): {name}")
 
@@ -201,12 +254,12 @@ class MCPClient:
             return text
 
 
-# ── upstream client (singleton) ────────────────────────────────────────────────────
+# ── upstream client (singleton) ───────────────────────────────────────────────
 
 _upstream = MCPClient(MEMPALACE_CMD)
 
 
-# ── dynamic tool registration ──────────────────────────────────────────────────────
+# ── dynamic tool registration ──────────────────────────────────────────────────
 
 mcp = FastMCP("mem-bridge", transport_security=_security)
 
@@ -240,7 +293,7 @@ session_manager = StreamableHTTPSessionManager(
 )
 
 
-# ── auth middleware + MCP handler ────────────────────────────────────────────────
+# ── auth middleware + MCP handler ─────────────────────────────────────────────
 
 async def _deny(send: Send, code: int, msg: bytes) -> None:
     await send({"type": "http.response.start", "status": code,
@@ -262,16 +315,17 @@ async def mcp_handler(scope: Scope, receive: Receive, send: Send) -> None:
     await session_manager.handle_request(scope, receive, send)
 
 
-# ── Starlette app + lifespan ─────────────────────────────────────────────────────
+# ── Starlette app + lifespan ──────────────────────────────────────────────────
 
 @contextlib.asynccontextmanager
 async def lifespan(_app: Starlette):
-    _upstream.start()
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _upstream.start)
     _register_tools()
     async with session_manager.run():
         log.info("[mem-bridge] ready")
         yield
-    _upstream.stop()
+    await loop.run_in_executor(None, _upstream.stop)
 
 
 app = Starlette(
